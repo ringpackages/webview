@@ -33,6 +33,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ring_webview_json.h"
+
 #define LOG_TAG "RingWebView"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -543,8 +545,8 @@ static char *build_bind_js(void)
 	return js;
 }
 
-// Store for re-inject on page load; eval now for the current page.
-static void rebuild_inject_js(void)
+// Inject script (bind shim + init scripts)
+static char *build_full_js(void)
 {
 	size_t cap;
 	char *full, *o, *bindJs;
@@ -552,7 +554,7 @@ static void rebuild_inject_js(void)
 
 	bindJs = build_bind_js();
 	if (!bindJs)
-		return;
+		return NULL;
 
 	// +64 covers the 33-char wrapper; snprintf truncates on miscount.
 	cap = strlen(bindJs) + 1 + 64;
@@ -575,15 +577,75 @@ static void rebuild_inject_js(void)
 			int w = snprintf(o, rem, "(function(){try{%s}catch(e){}})();", g_initScripts[i]);
 			o += (w < 0) ? 0 : ((size_t)w >= rem ? rem - 1 : (size_t)w);
 		}
+	}
+	free(bindJs);
+	return full;
+}
+
+// Store for re-inject on page load; eval now for the current page.
+static void rebuild_inject_js(void)
+{
+	char *full, *bindJs;
+
+	full = build_full_js();
+	if (full)
+	{
 		call_java_void_string(mid_setInjectJs, full);
 		free(full);
 	}
 
+	bindJs = build_bind_js();
+	if (!bindJs)
+		return;
 	call_java_void_string(mid_evalJs, bindJs);
 	free(bindJs);
 }
 
-#include "ring_webview_json.h"
+// Wrap setHtml content so bind shims exist before page scripts parse
+static char *wrap_html_with_shim(const char *cHtml, const char *cJs)
+{
+	static const char *cOpen = "<script>";
+	static const char *cClose = "</script>";
+	const char *p;
+	size_t htmlLen, jsLen, openLen, closeLen, preLen, total;
+	char *out;
+
+	if (!cHtml || !cJs)
+		return NULL;
+	p = strcasestr(cHtml, "<head");
+	if (p)
+		p = strchr(p, '>');
+	if (!p)
+	{
+		p = strcasestr(cHtml, "<html");
+		if (p)
+			p = strchr(p, '>');
+	}
+	if (!p)
+	{
+		p = strcasestr(cHtml, "<!doctype");
+		if (p)
+			p = strchr(p, '>');
+	}
+	if (p)
+		preLen = (size_t)(p + 1 - cHtml);
+	else
+		preLen = 0;
+	htmlLen = strlen(cHtml);
+	jsLen = strlen(cJs);
+	openLen = strlen(cOpen);
+	closeLen = strlen(cClose);
+	total = preLen + openLen + jsLen + closeLen + (htmlLen - preLen) + 1;
+	out = (char *)malloc(total);
+	if (!out)
+		return NULL;
+	memcpy(out, cHtml, preLen);
+	memcpy(out + preLen, cOpen, openLen);
+	memcpy(out + preLen + openLen, cJs, jsLen);
+	memcpy(out + preLen + openLen + jsLen, cClose, closeLen);
+	memcpy(out + preLen + openLen + jsLen + closeLen, cHtml + preLen, htmlLen - preLen + 1);
+	return out;
+}
 
 /* ============================================================================
  * Ring callback execution (worker thread)
@@ -1619,7 +1681,21 @@ RING_FUNC(ring_webview_set_html)
 		RING_API_ERROR(RING_API_BADPARATYPE);
 		return;
 	}
-	call_java_void_string(mid_loadHtml, RING_API_GETSTRING(2));
+	{
+		char *cJs = build_full_js();
+		if (cJs)
+		{
+			char *cWrapped = wrap_html_with_shim(RING_API_GETSTRING(2), cJs);
+			free(cJs);
+			if (cWrapped)
+			{
+				call_java_void_string(mid_loadHtml, cWrapped);
+				free(cWrapped);
+				return;
+			}
+		}
+		call_java_void_string(mid_loadHtml, RING_API_GETSTRING(2));
+	}
 }
 
 RING_FUNC(ring_webview_eval)
